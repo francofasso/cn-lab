@@ -1,0 +1,705 @@
+import socket
+import os
+import time
+import re
+import select
+import threading
+import sys
+from argparse import Namespace, ArgumentParser
+from collections import defaultdict
+from datetime import datetime
+from urllib.parse import unquote, parse_qs
+
+
+def parse_arguments() -> Namespace:
+    """
+    Parse command line arguments for the http server.
+    The three valid options are:
+        --address: The host to listen at. Default is "0.0.0.0"
+        --port: The port to listen at. Default is 8000
+        --directory: The directory to serve. Default is "data"
+    :return: The parsed arguments in a Namespace object.
+    """
+    parser: ArgumentParser = ArgumentParser(
+        prog="python -m a5_http_server",
+        description="A5 HTTP Server assignment for the VU Computer Networks course.",
+        epilog="Authors: Your group name"
+    )
+    parser.add_argument("-a", "--address",
+                        type=str, help="Set server address", default="0.0.0.0")
+    parser.add_argument("-p", "--port",
+                        type=int, help="Set server port", default=8000)
+    parser.add_argument("-d", "--directory",
+                        type=str, help="Set the directory to serve", default="a5_http_server/public")
+    return parser.parse_args()
+
+
+# Configuration constants
+BUFFER_SIZE = 4096
+TIMEOUT = 10  # Seconds for persistent connection timeout
+
+# MIME types mapping for content types
+MIME_TYPES = {
+    '.html': 'text/html',
+    '.css': 'text/css',
+    '.js': 'application/javascript',
+    '.jpeg': 'image/jpeg',
+    '.jpg': 'image/jpeg',
+    '.png': 'image/png',
+    '.pdf': 'application/pdf',
+    '.txt': 'text/plain',
+    '.ico': 'image/x-icon',
+}
+
+# Status codes and messages
+STATUS_CODES = {
+    200: 'OK',
+    201: 'Created',
+    400: 'Bad Request',
+    404: 'Not Found',
+}
+
+# Dictionary to store user-specific data for personal cats
+user_cats = {}
+user_cats_lock = threading.Lock()  # Lock to protect shared resource
+
+
+class HTTPRequest:
+    """Class to handle HTTP request parsing and state management"""
+
+    def __init__(self):
+        self.method = None
+        self.path = None
+        self.http_version = None
+        self.headers = {}
+        self.body = None
+        self.raw_data = b''
+        self.is_complete = False
+        self.content_length = None
+        self.headers_parsed = False
+
+    def process_data(self, data):
+        """Process incoming data and update request state"""
+        self.raw_data += data
+
+        # If headers not parsed yet, try to parse them
+        if not self.headers_parsed and b'\r\n\r\n' in self.raw_data:
+            self.parse_headers()
+
+        # If headers parsed, check for complete body
+        if self.headers_parsed:
+            headers_end = self.raw_data.find(b'\r\n\r\n') + 4
+            body_received = len(self.raw_data) - headers_end
+
+            # For POST requests, check Content-Length
+            if self.method == 'POST' and self.content_length is not None:
+                if body_received >= self.content_length:
+                    self.body = self.raw_data[headers_end:headers_end + self.content_length]
+                    self.is_complete = True
+            else:
+                # For GET requests, we're done once we have the headers
+                self.is_complete = True
+
+        return self.is_complete
+
+    def parse_headers(self):
+        """Parse request headers"""
+        try:
+            # Find the end of headers
+            headers_end = self.raw_data.find(b'\r\n\r\n')
+            if headers_end == -1:
+                return False
+
+            headers_data = self.raw_data[:headers_end].decode('utf-8')
+
+            # Parse the request line and headers
+            lines = headers_data.split('\r\n')
+            request_line = lines[0].split()
+
+            if len(request_line) != 3:
+                return False
+
+            self.method = request_line[0]
+            self.path = unquote(request_line[1])
+            self.http_version = request_line[2]
+
+            # Check HTTP version
+            if not self.http_version.startswith('HTTP/1.'):
+                return False
+
+            # Parse headers
+            for i in range(1, len(lines)):
+                if ': ' in lines[i]:
+                    key, value = lines[i].split(': ', 1)
+                    self.headers[key.lower()] = value
+
+            # Get content length for POST requests
+            if self.method == 'POST':
+                content_length_str = self.headers.get('content-length')
+                if content_length_str:
+                    self.content_length = int(content_length_str)
+
+            self.headers_parsed = True
+            return True
+        except Exception as e:
+            print(f"Error parsing headers: {e}")
+            return False
+
+
+class HTTPResponse:
+    """Class to handle HTTP response creation and partial sending"""
+
+    def __init__(self, status_code, content_type, content):
+        self.status_code = status_code
+        self.content_type = content_type
+        self.content = content
+        self.headers = []
+        self.position = 0  # Position in response for partial sends
+        self.headers_sent = False
+
+    def prepare_headers(self):
+        """Prepare the response headers"""
+        self.headers = [
+            f"HTTP/1.1 {self.status_code} {STATUS_CODES.get(self.status_code, 'Unknown')}",
+            f"Date: {datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT')}",
+            "Server: PythonHTTP/1.1",
+            f"Content-Type: {self.content_type}; charset=UTF-8",
+            f"Content-Length: {len(self.content)}",
+            "Connection: keep-alive"
+        ]
+
+        # Convert content to bytes if it's a string
+        if isinstance(self.content, str):
+            self.content = self.content.encode('utf-8')
+
+        # Prepare the full response with headers
+        self.response_headers = '\r\n'.join(self.headers) + '\r\n\r\n'
+        self.response_headers_bytes = self.response_headers.encode('utf-8')
+
+    def get_next_chunk(self, max_size=BUFFER_SIZE):
+        """Get the next chunk of data to send"""
+        if not self.headers_sent:
+            # If headers haven't been sent yet, send them first
+            chunk = self.response_headers_bytes
+            self.headers_sent = True
+            return chunk
+        else:
+            # Send a chunk of the content
+            start = self.position
+            end = min(self.position + max_size, len(self.content))
+            chunk = self.content[start:end]
+            self.position = end
+            return chunk
+
+    def is_complete(self):
+        """Check if the entire response has been sent"""
+        return self.headers_sent and self.position >= len(self.content)
+
+
+class EPollHTTPServer:
+    """High-performance HTTP server using epoll for efficient I/O multiplexing"""
+
+    def __init__(self, host, port, server_root):
+        self.host = host
+        self.port = port
+        self.server_root = server_root
+        self.server_socket = None
+        self.epoll = None
+        self.connections = {}  # fd -> socket
+        self.requests = {}  # fd -> HTTPRequest
+        self.responses = {}  # fd -> HTTPResponse
+        self.client_addr = {}  # fd -> (ip, port)
+        self.last_activity = {}  # fd -> timestamp
+
+        # Create server root directory if it doesn't exist
+        if not os.path.exists(server_root):
+            print(f"Warning: Directory {server_root} does not exist.")
+            # Don't create directory automatically as it should be provided
+
+    def start(self):
+        """Start the HTTP server"""
+        try:
+            # Check if epoll is available
+            if not hasattr(select, 'epoll'):
+                print("Error: epoll is not available on this platform.")
+                print("This server requires Linux for epoll functionality.")
+                sys.exit(1)
+
+            # Create socket
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.setblocking(0)  # Non-blocking socket
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(1000)  # Allow a large backlog for connections
+
+            # Create epoll object
+            self.epoll = select.epoll()
+            self.epoll.register(self.server_socket.fileno(), select.EPOLLIN)
+
+            print(f"HTTP Server running on http://{self.host}:{self.port}")
+            print(f"Serving files from directory: {self.server_root}")
+
+            # Start cleanup thread for inactive connections
+            cleanup_thread = threading.Thread(target=self.cleanup_inactive_connections)
+            cleanup_thread.daemon = True
+            cleanup_thread.start()
+
+            # Main event loop
+            while True:
+                events = self.epoll.poll(1)  # 1 second timeout
+
+                for fileno, event in events:
+                    # New connection
+                    if fileno == self.server_socket.fileno():
+                        self.accept_connection()
+                    # Existing connection has data to read
+                    elif event & select.EPOLLIN:
+                        self.handle_read(fileno)
+                    # Socket is available for writing
+                    elif event & select.EPOLLOUT:
+                        self.handle_write(fileno)
+                    # Connection closed or error
+                    elif event & (select.EPOLLHUP | select.EPOLLERR):
+                        self.close_connection(fileno)
+
+        except KeyboardInterrupt:
+            print("\nServer shutting down...")
+        except Exception as e:
+            print(f"Error in server: {e}")
+        finally:
+            self.cleanup()
+
+    def accept_connection(self):
+        """Accept a new client connection"""
+        try:
+            client_socket, address = self.server_socket.accept()
+            client_socket.setblocking(0)  # Non-blocking
+            fileno = client_socket.fileno()
+
+            # Register for read events
+            self.epoll.register(fileno, select.EPOLLIN)
+
+            # Store connection info
+            self.connections[fileno] = client_socket
+            self.requests[fileno] = HTTPRequest()
+            self.client_addr[fileno] = address
+            self.last_activity[fileno] = time.time()
+
+            print(f"Connection accepted from {address[0]}:{address[1]}")
+        except Exception as e:
+            print(f"Error accepting connection: {e}")
+
+    def handle_read(self, fileno):
+        """Handle data from a client connection"""
+        try:
+            self.last_activity[fileno] = time.time()
+
+            # Read data from socket
+            data = self.connections[fileno].recv(BUFFER_SIZE)
+
+            if data:
+                # Process the received data
+                request = self.requests[fileno]
+                request_complete = request.process_data(data)
+
+                if request_complete:
+                    # Generate response
+                    response = self.process_request(request, fileno)
+
+                    # Store response and change to write mode
+                    self.responses[fileno] = response
+                    self.epoll.modify(fileno, select.EPOLLOUT)
+            else:
+                # No data means the client closed the connection
+                self.close_connection(fileno)
+
+        except ConnectionError:
+            self.close_connection(fileno)
+        except Exception as e:
+            print(f"Error handling read: {e}")
+            self.close_connection(fileno)
+
+    def handle_write(self, fileno):
+        """Send data to a client"""
+        try:
+            self.last_activity[fileno] = time.time()
+
+            response = self.responses[fileno]
+            chunk = response.get_next_chunk()
+
+            if chunk:
+                # Send data
+                bytes_sent = self.connections[fileno].send(chunk)
+
+                # If we couldn't send all data, adjust the position
+                if bytes_sent < len(chunk) and response.headers_sent:
+                    response.position -= (len(chunk) - bytes_sent)
+
+            # Check if response is complete
+            if response.is_complete():
+                # Check if we need to close the connection or wait for more requests
+                keep_alive = True
+                request = self.requests[fileno]
+
+                if request.http_version == 'HTTP/1.0':
+                    keep_alive = False
+                else:
+                    connection_header = request.headers.get('connection', '').lower()
+                    keep_alive = connection_header != 'close'
+
+                if keep_alive:
+                    # Reset for next request
+                    self.requests[fileno] = HTTPRequest()
+                    self.epoll.modify(fileno, select.EPOLLIN)
+                else:
+                    # Close the connection
+                    self.close_connection(fileno)
+
+        except ConnectionError:
+            self.close_connection(fileno)
+        except Exception as e:
+            print(f"Error handling write: {e}")
+            self.close_connection(fileno)
+
+    def close_connection(self, fileno):
+        """Close a client connection"""
+        try:
+            # Check if we have this connection
+            if fileno not in self.connections:
+                return
+
+            client_addr = self.client_addr.get(fileno, ('unknown', 0))
+            print(f"Closing connection with {client_addr[0]}:{client_addr[1]}")
+
+            # Unregister from epoll
+            try:
+                self.epoll.unregister(fileno)
+            except:
+                pass  # May already be unregistered
+
+            # Close socket
+            self.connections[fileno].close()
+
+            # Remove from dictionaries
+            for d in [self.connections, self.requests, self.responses, self.client_addr, self.last_activity]:
+                if fileno in d:
+                    del d[fileno]
+
+        except Exception as e:
+            print(f"Error closing connection: {e}")
+
+    def cleanup_inactive_connections(self):
+        """Periodically clean up inactive connections"""
+        while True:
+            time.sleep(1)  # Check every second
+            now = time.time()
+
+            # Find connections that have been inactive for too long
+            for fileno, last_time in list(self.last_activity.items()):
+                if now - last_time > TIMEOUT:
+                    print(f"Connection timed out: {self.client_addr.get(fileno, ('unknown', 0))}")
+                    self.close_connection(fileno)
+
+    def process_request(self, request, fileno):
+        """Process an HTTP request and generate a response"""
+        client_id = f"{self.client_addr[fileno][0]}:{self.client_addr[fileno][1]}"
+
+        if not request.headers_parsed:
+            # Invalid request
+            return self.create_response(400, 'text/html', self.read_file('400.html'))
+
+        if request.method == 'GET':
+            return self.handle_get_request(request, client_id)
+        elif request.method == 'POST':
+            return self.handle_post_request(request, client_id)
+        else:
+            return self.create_response(400, 'text/html', self.read_file('400.html'))
+
+    def handle_get_request(self, request, client_id):
+        """Handle GET requests"""
+        path = request.path
+
+        # Default to index.html if root path
+        if path == '/' or path == '':
+            path = '/index.html'
+
+        # Check if it's the personal cats page
+        if path == '/personal_cats.html':
+            return self.serve_personal_cats(client_id)
+
+        # Map URL path to file path
+        file_path = os.path.join(self.server_root, path.lstrip('/'))
+
+        # Security check: prevent directory traversal
+        real_path = os.path.realpath(file_path)
+        server_path = os.path.realpath(self.server_root)
+        if not real_path.startswith(server_path):
+            return self.create_response(400, 'text/html', self.read_file('400.html'))
+
+        # Check if file exists
+        if not os.path.isfile(file_path):
+            return self.create_response(404, 'text/html', self.read_file('404.html'))
+
+        # Get content type based on file extension
+        _, ext = os.path.splitext(file_path)
+        content_type = MIME_TYPES.get(ext.lower(), 'application/octet-stream')
+
+        # Read file content
+        file_content = self.read_file(file_path)
+
+        # Create response
+        return self.create_response(200, content_type, file_content)
+
+    def handle_post_request(self, request, client_id):
+        """Handle POST requests"""
+        if request.path == '/data':
+            # Parse form data from request body
+            content_type = request.headers.get('content-type', '')
+
+            if 'application/x-www-form-urlencoded' in content_type:
+                # Decode the form data
+                body_str = request.body.decode('utf-8')
+                parsed_data = parse_qs(body_str)
+
+                # Extract form fields
+                cat_url = parsed_data.get('cat_url', [''])[0]
+                description = parsed_data.get('description', [''])[0]
+
+                # Validate form fields
+                if not cat_url or not description:
+                    return self.create_response(400, 'text/html', self.read_file('400.html'))
+
+                # Store the cat data for this client
+                with user_cats_lock:
+                    if client_id not in user_cats:
+                        user_cats[client_id] = []
+
+                    user_cats[client_id].append({
+                        'url': cat_url,
+                        'description': description
+                    })
+
+                # Send successful response
+                return self.create_response(201, 'text/html', self.read_file('success.html'))
+            else:
+                return self.create_response(400, 'text/html', self.read_file('400.html'))
+        else:
+            return self.create_response(400, 'text/html', self.read_file('400.html'))
+
+    def serve_personal_cats(self, client_id):
+        """Serve the personal cats page"""
+        # Read the personal_cats.html template
+        template = self.read_file('personal_cats.html')
+
+        # Generate table rows for this client's cats
+        table_content = ''
+        with user_cats_lock:
+            if client_id in user_cats:
+                for cat in user_cats[client_id]:
+                    table_content += f'<tr><td><img src="{cat["url"]}" width="300"/></td></tr>\n'
+                    table_content += f'<tr><td>{cat["description"]}</td></tr>\n'
+
+        # Replace placeholder with generated content
+        content = template.replace('TABLE_PLACEHOLDER', table_content)
+
+        # Create response
+        return self.create_response(200, 'text/html', content)
+
+    def create_response(self, status_code, content_type, content):
+        """Create an HTTP response object"""
+        response = HTTPResponse(status_code, content_type, content)
+        response.prepare_headers()
+        return response
+
+    def read_file(self, file_path):
+        """Read a file from disk"""
+        try:
+            if not file_path.startswith(self.server_root):
+                # If a relative path was provided, prepend server root
+                file_path = os.path.join(self.server_root, file_path)
+
+            # Security check: prevent directory traversal
+            real_path = os.path.realpath(file_path)
+            server_path = os.path.realpath(self.server_root)
+            if not real_path.startswith(server_path):
+                # Attempt to access file outside of root directory
+                if status_code == 404:
+                    return "File not found"
+                return "Bad request"
+
+            # Determine if we should open in binary or text mode based on file extension
+            _, ext = os.path.splitext(file_path)
+            is_binary = ext.lower() not in ['.html', '.css', '.js', '.txt']
+
+            mode = 'rb' if is_binary else 'r'
+            with open(file_path, mode) as file:
+                content = file.read()
+                return content
+        except FileNotFoundError:
+            # If the file we're looking for is the error page itself and it's not found
+            if file_path.endswith('404.html'):
+                return "<html><body><h1>404 Not Found</h1><p>The requested resource was not found on this server.</p></body></html>"
+            elif file_path.endswith('400.html'):
+                return "<html><body><h1>400 Bad Request</h1><p>The server could not understand the request.</p></body></html>"
+            elif file_path.endswith('success.html'):
+                return "<html><body><h1>201 Created</h1><p>Your submission was successful.</p></body></html>"
+            # Return empty content
+            return b'' if is_binary else ''
+        except Exception as e:
+            print(f"Error reading file {file_path}: {e}")
+            # Return empty content
+            return b'' if is_binary else ''
+
+    def cleanup(self):
+        """Clean up resources"""
+        if self.epoll:
+            try:
+                self.epoll.unregister(self.server_socket.fileno())
+            except:
+                pass
+            self.epoll.close()
+
+        if self.server_socket:
+            self.server_socket.close()
+
+        # Close all client connections
+        for fileno in list(self.connections.keys()):
+            try:
+                self.connections[fileno].close()
+            except:
+                pass
+
+
+class ThreadPoolHTTPServer:
+    """HTTP server implementation using a thread pool for platforms without epoll support"""
+
+    def __init__(self, host, port, server_root):
+        self.host = host
+        self.port = port
+        self.server_root = server_root
+        self.socket = None
+        self.connections = {}  # To track active connections
+        self.connection_lock = threading.Lock()  # Lock to protect connections dictionary
+        self.running = True
+        self.worker_threads = []
+
+        # Number of worker threads in the pool
+        self.num_workers = min(20, os.cpu_count() * 2 + 1) if os.cpu_count() else 20
+
+        # Task queue for thread pool
+        self.task_queue = queue.Queue()
+
+        # Create server root directory if it doesn't exist
+        if not os.path.exists(server_root):
+            print(f"Warning: Directory {server_root} does not exist.")
+
+    def start_workers(self):
+        """Start worker threads for the thread pool"""
+        for _ in range(self.num_workers):
+            worker = threading.Thread(target=self.worker_thread)
+            worker.daemon = True
+            worker.start()
+            self.worker_threads.append(worker)
+
+    def worker_thread(self):
+        """Worker thread function that processes tasks from the queue"""
+        while self.running:
+            try:
+                # Get task from queue with timeout
+                client_socket, address = self.task_queue.get(timeout=1)
+
+                try:
+                    self.handle_client(client_socket, address)
+                except Exception as e:
+                    print(f"Error in worker thread: {e}")
+                finally:
+                    # Mark task as done
+                    self.task_queue.task_done()
+            except queue.Empty:
+                # Timeout on queue.get, check if we're still running
+                continue
+
+    def start(self):
+        try:
+            print("Starting HTTP server with thread pool (no epoll support detected)")
+
+            # Create socket
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.socket.bind((self.host, self.port))
+            self.socket.listen(100)  # Allow a backlog for connections
+            self.socket.settimeout(1)  # 1 second timeout for accept()
+
+            print(f"HTTP Server running on http://{self.host}:{self.port}")
+            print(f"Serving files from directory: {self.server_root}")
+
+            # Start worker threads
+            self.start_workers()
+
+            while self.running:
+                try:
+                    # Accept connection with timeout
+                    client_socket, address = self.socket.accept()
+                    # Add task to queue instead of creating a new thread
+                    self.task_queue.put((client_socket, address))
+                except socket.timeout:
+                    # Just a timeout on accept, continue
+                    continue
+
+        except KeyboardInterrupt:
+            print("\nServer shutting down...")
+        except Exception as e:
+            print(f"Error: {e}")
+        finally:
+            self.cleanup()
+
+    def handle_client(self, client_socket, address):
+        # Implementation of client handling would go here
+        # Similar to the EPollHTTPServer implementation but adapted for thread pool
+        pass  # This is just a placeholder - the actual implementation would be needed for this class
+
+    def cleanup(self):
+        """Clean up server resources"""
+        print("Cleaning up server resources...")
+        self.running = False
+
+        # Wait for worker threads to finish (with timeout)
+        for thread in self.worker_threads:
+            thread.join(0.5)
+
+        if self.socket:
+            self.socket.close()
+
+        print("Server shutdown complete")
+
+
+def main() -> None:
+    """Main function to start the HTTP server"""
+    parser: Namespace = parse_arguments()
+    port: int = parser.port
+    host: str = parser.address
+    base_directory: str = parser.directory
+
+    # Check if the directory exists
+    if not os.path.exists(base_directory):
+        print(f"Error: Directory '{base_directory}' does not exist.")
+        sys.exit(1)
+
+    # Check if epoll is available (Linux systems)
+    if hasattr(select, 'epoll'):
+        server = EPollHTTPServer(host, port, base_directory)
+    else:
+        print("Warning: epoll not available on this platform. Using thread pool instead.")
+        # Note: The ThreadPoolHTTPServer implementation is not complete in this code
+        # A full implementation would be required for non-Linux platforms
+        server = ThreadPoolHTTPServer(host, port, base_directory)
+
+    # Start the server
+    try:
+        server.start()
+    except KeyboardInterrupt:
+        print("\nShutting down the server...")
+
+
+if __name__ == "__main__":
+    main()
